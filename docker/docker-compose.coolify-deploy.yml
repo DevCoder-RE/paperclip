@@ -1,0 +1,55 @@
+# documentation: https://docs.paperclip.ai
+# slogan: Control plane for AI-agent companies
+# category: developer-tools
+# tags: ai, agents, automation, orchestration
+# logo: svgs/paperclip.svg
+# port: 3100
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_USER=$SERVICE_USER_POSTGRES
+      - POSTGRES_PASSWORD=$SERVICE_PASSWORD_POSTGRES
+      - POSTGRES_DB=paperclip
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - type: bind
+        source: ./pgdata
+        target: /var/lib/postgresql/data
+        is_directory: true
+
+  paperclip:
+    image: ghcr.io/paperclipai/paperclip:latest
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3100
+      - SERVE_UI=true
+      - PAPERCLIP_HOME=/paperclip
+      - PAPERCLIP_DEPLOYMENT_MODE=authenticated
+      - PAPERCLIP_DEPLOYMENT_EXPOSURE=private
+      - DATABASE_URL=postgres://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@db:5432/paperclip
+      - SERVICE_URL_PAPERCLIP_3100
+      - PAPERCLIP_PUBLIC_URL=$SERVICE_URL_PAPERCLIP
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:?Better Auth secret required}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENCODE_ALLOW_ALL_MODELS=true
+    volumes:
+      - type: bind
+        source: ./data
+        target: /paperclip
+        is_directory: true
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
