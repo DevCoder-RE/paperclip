@@ -40,10 +40,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENCODE_ALLOW_ALL_MODELS=true
     volumes:
-      - type: bind
-        source: ./data
-        target: /paperclip
-        is_directory: true
+      - paperclip_data:/paperclip
     depends_on:
       db:
         condition: service_healthy
@@ -53,3 +50,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+volumes:
+  paperclip_data:
+  pgdata:
