@@ -34,6 +34,7 @@ services:
       - PAPERCLIP_DEPLOYMENT_EXPOSURE=private
       - DATABASE_URL=postgres://${SERVICE_USER_POSTGRES}:${SERVICE_PASSWORD_POSTGRES}@db:5432/paperclip
       - PAPERCLIP_PUBLIC_URL=https://paperclip.roninent.com
+    command: sh -c "sed -i 's/\"host\": \"127.0.0.1\"/\"host\": \"0.0.0.0\"/g' /paperclip/instances/default/config.json 2>/dev/null || true && node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js"
       - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:?Better Auth secret required}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
