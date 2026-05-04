@@ -9,8 +9,8 @@ services:
   db:
     image: postgres:17-alpine
     environment:
-      - POSTGRES_USER=$SERVICE_USER_POSTGRES
-      - POSTGRES_PASSWORD=$SERVICE_PASSWORD_POSTGRES
+      - POSTGRES_USER=${SERVICE_USER_POSTGRES}
+      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
       - POSTGRES_DB=paperclip
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
@@ -18,10 +18,7 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - type: bind
-        source: ./pgdata
-        target: /var/lib/postgresql/data
-        is_directory: true
+      - pgdata:/var/lib/postgresql/data
 
   paperclip:
     image: ghcr.io/paperclipai/paperclip:latest
@@ -38,7 +35,6 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENCODE_ALLOW_ALL_MODELS=true
-    command: sh -c "sed -i 's/\"host\": \"127.0.0.1\"/\"host\": \"0.0.0.0\"/g' /paperclip/instances/default/config.json 2>/dev/null || true && exec node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js"
     volumes:
       - paperclip_data:/paperclip
     depends_on:
