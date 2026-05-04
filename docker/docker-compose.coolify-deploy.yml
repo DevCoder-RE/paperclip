@@ -25,6 +25,7 @@ services:
 
   paperclip:
     image: ghcr.io/paperclipai/paperclip:latest
+    user: "0:0"
     environment:
       - HOST=0.0.0.0
       - PORT=3100
