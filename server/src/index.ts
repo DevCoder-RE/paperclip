@@ -15,6 +15,7 @@ import {
   inspectMigrations,
   applyPendingMigrations,
   createEmbeddedPostgresLogBuffer,
+  prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
@@ -30,11 +31,18 @@ import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
   feedbackService,
+  backfillPrincipalAccessCompatibility,
+  bootstrapExecutionPolicyFromEnv,
   heartbeatService,
   instanceSettingsService,
+  reconcileCloudUpstreamRunsOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
+import {
+  parseAdapterRegistryEnv,
+  reconcileAdapterAvailability,
+} from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
@@ -187,6 +195,31 @@ export async function startServer(): Promise<StartedServer> {
     return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
   }
 
+  function isPostgresConnectionString(connectionString: string): boolean {
+    try {
+      const parsed = new URL(connectionString);
+      return parsed.protocol === "postgres:" || parsed.protocol === "postgresql:";
+    } catch {
+      return false;
+    }
+  }
+
+  function assertCloudDatabaseContract(): void {
+    if (config.deploymentMode !== "authenticated" || config.deploymentExposure !== "public") {
+      return;
+    }
+    if (!config.databaseUrl) {
+      throw new Error(
+        "authenticated public deployments require DATABASE_URL or config.database.connectionString; refusing embedded PostgreSQL fallback",
+      );
+    }
+    if (!isPostgresConnectionString(config.databaseUrl)) {
+      throw new Error(
+        "authenticated public deployments require DATABASE_URL to be a postgres/postgresql connection string",
+      );
+    }
+  }
+
   function rewriteLocalUrlPort(rawUrl: string | undefined, port: number): string | undefined {
     if (!rawUrl) return undefined;
     try {
@@ -270,6 +303,7 @@ export async function startServer(): Promise<StartedServer> {
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
+  assertCloudDatabaseContract();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
@@ -290,6 +324,7 @@ export async function startServer(): Promise<StartedServer> {
         "Embedded PostgreSQL mode requires dependency `embedded-postgres`. Reinstall dependencies (without omitting required packages), or set DATABASE_URL for external Postgres.",
       );
     }
+    await prepareEmbeddedPostgresNativeRuntime();
   
     const dataDir = resolve(config.embeddedPostgresDataDir);
     const configuredPort = config.embeddedPostgresPort;
@@ -486,6 +521,10 @@ export async function startServer(): Promise<StartedServer> {
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
+  const accessBackfill = await backfillPrincipalAccessCompatibility(db as any);
+  if (accessBackfill.agentMembershipsInserted > 0 || accessBackfill.humanGrantsInserted > 0) {
+    logger.info(accessBackfill, "Backfilled principal access compatibility records");
+  }
   if (config.deploymentMode === "authenticated") {
     const {
       createBetterAuthHandler,
@@ -668,7 +707,41 @@ export async function startServer(): Promise<StartedServer> {
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
     });
+
+  void reconcileCloudUpstreamRunsOnStartup(db as any)
+    .then((result) => {
+      if (result.reconciled > 0) {
+        logger.warn(
+          { reconciled: result.reconciled },
+          "reconciled cloud upstream runs from a previous server process",
+        );
+      }
+    })
+    .catch((err) => {
+      logger.error({ err }, "startup reconciliation of cloud upstream runs failed");
+    });
   
+  // Force the instance onto the Kubernetes sandbox provider when configured via
+  // env (PAPERCLIP_EXECUTION_MODE=kubernetes). Runs BEFORE the heartbeat resumes
+  // queued runs so the policy + managed k8s environments are in place. A bad
+  // PAPERCLIP_EXECUTION_MODE / PAPERCLIP_K8S_* value throws and fails startup
+  // (fail-loud) rather than silently allowing local execution.
+  try {
+    const policyResult = await bootstrapExecutionPolicyFromEnv(db as any);
+    if (policyResult) {
+      logger.warn(
+        {
+          executionMode: policyResult.executionMode,
+          companiesConfigured: policyResult.companiesConfigured,
+        },
+        "forced execution policy applied at startup",
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, "failed to apply forced execution policy from environment");
+    throw err;
+  }
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
@@ -686,6 +759,7 @@ export async function startServer(): Promise<StartedServer> {
           reconciled.assignmentDispatched > 0 ||
           reconciled.dispatchRequeued > 0 ||
           reconciled.continuationRequeued > 0 ||
+          reconciled.successfulRunHandoffEscalated > 0 ||
           reconciled.escalated > 0
         ) {
           logger.warn(
@@ -704,6 +778,12 @@ export async function startServer(): Promise<StartedServer> {
         const scanned = await heartbeat.scanSilentActiveRuns();
         if (scanned.created > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+        }
+      })
+      .then(async () => {
+        const swept = await heartbeat.sweepStaleIssueLocks();
+        if (swept.cleared > 0) {
+          logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
       })
       .then(async () => {
@@ -751,6 +831,7 @@ export async function startServer(): Promise<StartedServer> {
             reconciled.assignmentDispatched > 0 ||
             reconciled.dispatchRequeued > 0 ||
             reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
             reconciled.escalated > 0
           ) {
             logger.warn(
@@ -769,6 +850,12 @@ export async function startServer(): Promise<StartedServer> {
           const scanned = await heartbeat.scanSilentActiveRuns();
           if (scanned.created > 0 || scanned.escalated > 0) {
             logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+          }
+        })
+        .then(async () => {
+          const swept = await heartbeat.sweepStaleIssueLocks();
+          if (swept.cleared > 0) {
+            logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
           }
         })
         .then(async () => {
@@ -806,6 +893,18 @@ export async function startServer(): Promise<StartedServer> {
   // reject valid external adapter types during the startup loading window.
   const { waitForExternalAdapters } = await import("./adapters/registry.js");
   await waitForExternalAdapters();
+
+  // Reconcile the agent-creation picker to the declaratively-configured adapter
+  // set (PAPERCLIP_ADAPTERS). Must run after external adapters are loaded so the
+  // known-adapter list is complete. Fail loud on misconfig (a declared adapter
+  // with no implementation), consistent with the execution-policy bootstrap:
+  // log the structured error, then rethrow to fail startup.
+  try {
+    reconcileAdapterAvailability(parseAdapterRegistryEnv());
+  } catch (err) {
+    logger.error({ err }, "failed to reconcile adapter availability from PAPERCLIP_ADAPTERS");
+    throw err;
+  }
 
   await new Promise<void>((resolveListen, rejectListen) => {
     const onError = (err: Error) => {
@@ -875,6 +974,9 @@ export async function startServer(): Promise<StartedServer> {
         telemetryClient.stop();
         await telemetryClient.flush();
       }
+
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => void } }).locals?.paperclipShutdown;
+      appShutdown?.();
 
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
         logger.info({ signal }, "Stopping embedded PostgreSQL");
